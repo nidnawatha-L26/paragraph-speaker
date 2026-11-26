@@ -52,6 +52,22 @@ Until the voice is installed, the mod reads with the system's own voice, which w
 
 The text you listen to reaches the voice through standard input or an environment variable, never through a command line.
 
+## Update
+
+Claude Code doesn't update this mod by itself. It keeps plugins up to date automatically only from Anthropic's official marketplaces; for other marketplaces, like this one, automatic updates start switched off. To get the latest version:
+
+**1. Update the mod.** Type `/plugin`, open the **Installed** tab, choose **paragraph-speaker**, and pick **Update now**. Or, in a terminal:
+
+```
+claude plugin update paragraph-speaker@paragraph-speaker
+```
+
+**2. Load it.** Type `/reload-plugins`, or restart Claude Code.
+
+The voice you installed with `/speak setup` stays where it is, so there is no need to run the setup again.
+
+**To get updates without asking**, type `/plugin`, open the **Marketplaces** tab, choose **paragraph-speaker**, and switch on auto-update. Claude Code then looks for a new version each time it starts, and the new version loads the next time you start it (or after `/reload-plugins`).
+
 ## Use
 
 | Where | How |
