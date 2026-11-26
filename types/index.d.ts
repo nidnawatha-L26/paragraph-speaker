@@ -1,8 +1,8 @@
 /**
  * What is being read aloud, as the band above the prompt shows it: the text's
  * words (split on single spaces) and the one being spoken (`current`, -1 before
- * the first). `voice` says who reads: Kokoro reports each word; the Windows
- * voice does not.
+ * the first). `voice` says who reads: Kokoro reports each word; a system voice
+ * (`windows`, the name kept from 1.0 on every system) does not.
  */
 export type ReadingView = {
   words: string[]

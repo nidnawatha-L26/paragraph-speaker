@@ -17,7 +17,7 @@ import {
 } from './mark'
 import type { CellRef, ExplanationPart, GridCell, GridTable, Line, MarkStyle, Piece, Span } from './mark'
 
-// ── Diagnostics: what each reading did, in %LOCALAPPDATA%\paragraph-speaker\debug.log ──
+// ── Diagnostics: what each reading did, in debug.log in the voice's install folder ──
 // Off; set DEBUG to true to write the log again when something needs finding out.
 // Lines are noted anywhere (drawing included) and written from outside drawing.
 const DEBUG = false
@@ -34,7 +34,12 @@ function note(line: string): void {
 async function flushNotes($: EngineInterface): Promise<void> {
   if (!DEBUG) return
   try {
-    debugFile ??= `${await $.env.get('LOCALAPPDATA')}\\paragraph-speaker\\debug.log`
+    if (debugFile === undefined) {
+      const platform = await platformOf($)
+      const home = (await homesHere($, platform))[0]
+      if (home === undefined) return
+      debugFile = joinPath(platform, home, 'debug.log')
+    }
     await $.fs.write(debugFile, debugLines.join('\n') + '\n')
   } catch {
     // diagnostics never get in the way of reading
@@ -488,9 +493,126 @@ export const VOICES = [
 ] as const
 const DEFAULT_VOICE = 'af_heart'
 
-type KokoroInstall = { home: string; python: string; model: string; voices: string; script: string }
+/** The systems the mod knows; WSL counts as Linux. */
+export type Platform = 'windows' | 'macos' | 'linux'
 
-/** Finds the Kokoro install, or undefined: then the Windows voice speaks. */
+/** The system the engine runs on: the session's own word, else uname's. */
+async function platformOf($: EngineInterface): Promise<Platform> {
+  try {
+    const { platform } = await $.session.info()
+    if (platform === 'windows' || platform === 'macos') return platform
+    if (platform === 'linux' || platform === 'wsl') return 'linux'
+  } catch {
+    // asked again below
+  }
+  const { sysname } = await $.session.machine()
+  return sysname === 'Windows_NT' ? 'windows' : sysname === 'Darwin' ? 'macos' : 'linux'
+}
+
+/** Joins path parts with the system's separator. */
+export function joinPath(platform: Platform, ...parts: string[]): string {
+  const sep = platform === 'windows' ? '\\' : '/'
+  return parts
+    .map((part, i) => (i === 0 ? part.replace(/[\\/]+$/, '') : part.replace(/^[\\/]+|[\\/]+$/g, '')))
+    .filter((part, i) => i === 0 || part !== '')
+    .join(sep)
+}
+
+/** The environment variables that decide where the voice is installed. */
+export type HomeEnv = { LOCALAPPDATA?: string | undefined; HOME?: string | undefined; XDG_DATA_HOME?: string | undefined }
+
+/**
+ * Where the voice is installed, the first the one setup writes to. On Windows
+ * the Claude app is a packaged app, so what it writes under AppData\Local
+ * lands under Packages\Claude_...\LocalCache: both spellings are tried.
+ */
+export function installHomes(platform: Platform, env: HomeEnv): string[] {
+  if (platform === 'windows') {
+    if (!env.LOCALAPPDATA) return []
+    return [
+      joinPath(platform, env.LOCALAPPDATA, 'paragraph-speaker'),
+      joinPath(platform, env.LOCALAPPDATA, 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Local', 'paragraph-speaker'),
+    ]
+  }
+  if (platform === 'macos') return env.HOME ? [joinPath(platform, env.HOME, 'Library', 'Application Support', 'paragraph-speaker')] : []
+  // XDG says a relative XDG_DATA_HOME is to be ignored.
+  if (env.XDG_DATA_HOME?.startsWith('/')) return [joinPath(platform, env.XDG_DATA_HOME, 'paragraph-speaker')]
+  return env.HOME ? [joinPath(platform, env.HOME, '.local', 'share', 'paragraph-speaker')] : []
+}
+
+async function homesHere($: EngineInterface, platform: Platform): Promise<string[]> {
+  if (platform === 'windows') return installHomes(platform, { LOCALAPPDATA: await $.env.get('LOCALAPPDATA') })
+  return installHomes(platform, { HOME: await $.env.get('HOME'), XDG_DATA_HOME: await $.env.get('XDG_DATA_HOME') })
+}
+
+/** The Python inside the voice's own environment. */
+export function venvPython(platform: Platform, home: string): string {
+  return platform === 'windows' ? joinPath(platform, home, 'venv', 'Scripts', 'python.exe') : joinPath(platform, home, 'venv', 'bin', 'python')
+}
+
+/**
+ * The command that ends process `pid` and what it started. On macOS and Linux
+ * the Kokoro script leads its own process group (`isGroup`), its player in it.
+ */
+export function stopCommand(platform: Platform, pid: string, isGroup: boolean): string[] {
+  if (platform === 'windows') return ['taskkill', '/F', '/T', '/PID', pid]
+  return isGroup ? ['kill', '-TERM', '--', `-${pid}`] : ['kill', '-TERM', pid]
+}
+
+/**
+ * A system voice to read with when Kokoro is not there. Each first writes
+ * `pid <n>` so it can be stopped; the text goes in through stdin or an env
+ * var, never on the command line. `cancel` also stops a speech daemon.
+ */
+export type SystemVoice = { name: string; argv: string[]; textVia: 'stdin' | 'env'; cancel?: string[] }
+
+/** The text's env var for a voice that takes it by `env`. */
+export const TEXT_VAR = 'PARAGRAPH_SPEAKER_TEXT'
+
+/** Exit code of `sh` when the program it was to run is not installed. */
+const NOT_FOUND = 127
+
+/** The system voices to try, in order, after the engine's own synthesizer. */
+export function systemVoices(platform: Platform): SystemVoice[] {
+  const sh = (program: string): string[] => ['sh', '-c', `echo "pid $$"; exec ${program}`]
+  if (platform === 'windows') {
+    return [
+      {
+        name: 'Windows voice',
+        argv: [
+          'powershell',
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `Write-Output "pid $PID"; Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak($env:${TEXT_VAR})`,
+        ],
+        textVia: 'env',
+      },
+    ]
+  }
+  if (platform === 'macos') return [{ name: 'say', argv: sh('say'), textVia: 'stdin' }]
+  return [
+    { name: 'espeak-ng', argv: sh('espeak-ng --stdin'), textVia: 'stdin' },
+    { name: 'espeak', argv: sh('espeak --stdin'), textVia: 'stdin' },
+    { name: 'spd-say', argv: sh('spd-say --wait --pipe-mode'), textVia: 'stdin', cancel: ['spd-say', '--cancel'] },
+  ]
+}
+
+/** The Pythons that may run the setup script, in order. */
+export function setupPythons(platform: Platform): string[][] {
+  return platform === 'windows' ? [['py', '-3'], ['python'], ['python3']] : [['python3'], ['python']]
+}
+
+type KokoroInstall = {
+  platform: Platform
+  home: string
+  python: string
+  model: string
+  voices: string
+  script: string
+}
+
+/** Finds the Kokoro install, or undefined: then a system voice speaks. */
 async function findKokoro($: EngineInterface): Promise<KokoroInstall | undefined> {
   try {
     return await lookForKokoro($)
@@ -499,27 +621,18 @@ async function findKokoro($: EngineInterface): Promise<KokoroInstall | undefined
   }
 }
 
-/**
- * The Claude app is a packaged Windows app, so what it writes under
- * AppData\Local really lands under Packages\Claude_...\LocalCache: both
- * spellings are tried, so a session started outside the app finds it too.
- */
 async function lookForKokoro($: EngineInterface): Promise<KokoroInstall | undefined> {
   const root = (await $.process.hookEnv()).CLAUDE_PLUGIN_ROOT
   if (!root) return undefined
-  const local = await $.env.get('LOCALAPPDATA')
-  if (!local) return undefined
-  const homes = [
-    `${local}\\paragraph-speaker`,
-    `${local}\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\paragraph-speaker`,
-  ]
-  for (const home of homes) {
+  const platform = await platformOf($)
+  for (const home of await homesHere($, platform)) {
     const install: KokoroInstall = {
+      platform,
       home,
-      python: `${home}\\venv\\Scripts\\python.exe`,
-      model: `${home}\\models\\kokoro-v1.0.onnx`,
-      voices: `${home}\\models\\voices-v1.0.bin`,
-      script: `${root}\\tts\\kokoro_speak.py`,
+      python: venvPython(platform, home),
+      model: joinPath(platform, home, 'models', 'kokoro-v1.0.onnx'),
+      voices: joinPath(platform, home, 'models', 'voices-v1.0.bin'),
+      script: joinPath(platform, root, 'tts', 'kokoro_speak.py'),
     }
     const found = await Promise.all([install.python, install.model, install.voices, install.script].map(p => $.fs.exists(p)))
     if (found.every(Boolean)) return install
@@ -537,12 +650,17 @@ type Run = { isStopped: boolean; stop: () => void }
 let current: Run | undefined
 
 /** `rowId`: the transcript row the selection lies in, when one is known. */
-async function speakSelection($: EngineInterface, selected: string | undefined, rowId?: string): Promise<string> {
+async function speakSelection(
+  $: EngineInterface,
+  selected: string | undefined,
+  rowId?: string,
+  what = 'the selected text',
+): Promise<string> {
   if (toSpeech(selected ?? '') === '') return 'Select some words in a reply first.'
   current?.stop() // a reading under way stops now, not after an explanation is ready
   const { text, skip, tableRefs, tables } = await speechFor($, selected ?? '', rowId)
   await speakText($, text, rowId, skip, tableRefs)
-  return tables === 0 ? 'Reading the selected text.' : `Reading the selected text, ${tables === 1 ? 'its table' : `its ${tables} tables`} explained.`
+  return tables === 0 ? `Reading ${what}.` : `Reading ${what}, ${tables === 1 ? 'its table' : `its ${tables} tables`} explained.`
 }
 
 async function speakText(
@@ -574,21 +692,29 @@ async function speakText(
   void (async () => {
     try {
       const kokoro = await findKokoro($)
-      note(kokoro === undefined ? `read #${id}: no Kokoro found, Windows voice` : `read #${id}: Kokoro at ${kokoro.home}`)
+      note(kokoro === undefined ? `read #${id}: no Kokoro found, system voice` : `read #${id}: Kokoro at ${kokoro.home}`)
       if (kokoro !== undefined && !run.isStopped) {
         const failed = await speakWithKokoro($, kokoro, text, run)
         if (failed === undefined || run.isStopped) return
-        await $.ui.toast(`Kokoro voice failed (${failed}); using the Windows voice.`)
+        await $.ui.toast(`Kokoro voice failed (${failed}); using the system voice.`)
       }
       if (run.isStopped) return
       if (kokoro === undefined && !hasHintedSetup && !isSettingUp) {
         hasHintedSetup = true
         void Promise.resolve(
-          $.ui.toast('Reading with the Windows voice. For the natural voice, with each word marked, type /speak setup.'),
+          $.ui.toast('Reading with the system voice. For the natural voice, with each word marked, type /speak setup.'),
         ).catch(() => undefined)
       }
+      // 'windows' is the state's name for any system voice: it marks no words.
       await update($, reading, view => view && { ...view, current: -1, voice: 'windows' as const })
-      await speakWithSystem($, text, run)
+      const spoke = await speakWithSystem($, text, run)
+      if (!spoke && !run.isStopped) {
+        await $.ui.toast(
+          (await platformOf($)) === 'linux'
+            ? 'No voice found. Install espeak-ng (or speech-dispatcher), or type /speak setup for the natural voice.'
+            : 'No voice found. Type /speak setup for the natural voice.',
+        )
+      }
     } catch (error) {
       note(`read #${id}: failed: ${String(error)}`)
       if (!run.isStopped) await $.ui.toast(`Could not speak: ${String(error)}`)
@@ -622,9 +748,9 @@ async function speakWithKokoro(
   let pid: string | undefined
   let pending = ''
   let stderr = ''
-  // The script names its process first; Stop ends that process, which ends the sound.
+  // The script names its process first; Stop ends that process (and its player), which ends the sound.
   const kill = () => {
-    if (pid !== undefined) void $.process.run(['taskkill', '/F', '/T', '/PID', pid]).catch(() => undefined)
+    if (pid !== undefined) void $.process.run(stopCommand(kokoro.platform, pid, true)).catch(() => undefined)
   }
   run.stop = () => {
     run.isStopped = true
@@ -664,8 +790,11 @@ async function speakWithKokoro(
   return stderr.trim().split(/\r?\n/).at(-1) || `exit code ${ended.code}`
 }
 
-/** Windows' own voice: the engine's synthesizer, else System.Speech directly. */
-async function speakWithSystem($: EngineInterface, text: string, run: Run): Promise<void> {
+/**
+ * The system's own voice: the engine's synthesizer, else the first of the
+ * system's voice programs that is installed. False when none could speak.
+ */
+async function speakWithSystem($: EngineInterface, text: string, run: Run): Promise<boolean> {
   const abort = new AbortController()
   run.stop = () => {
     run.isStopped = true
@@ -673,19 +802,57 @@ async function speakWithSystem($: EngineInterface, text: string, run: Run): Prom
   }
   try {
     await $.audio.speak(text, { signal: abort.signal })
+    return true
   } catch {
-    if (run.isStopped) return
-    // The text travels in an env var, never in the command line, so nothing in it is run.
-    await $.process.run(
-      [
-        'powershell',
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        'Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak($env:PARAGRAPH_SPEAKER_TEXT)',
-      ],
-      { env: { PARAGRAPH_SPEAKER_TEXT: text }, timeoutMs: 600_000 },
-    )
+    if (run.isStopped) return true
+  }
+  const platform = await platformOf($)
+  for (const voice of systemVoices(platform)) {
+    if (run.isStopped) return true
+    const ended = await speakWithProgram($, platform, voice, text, run)
+    note(`system voice ${voice.name}: ${ended}`)
+    if (ended === 'spoke') return true
+  }
+  return false
+}
+
+/** Reads `text` with one voice program; 'missing' when it is not installed. */
+async function speakWithProgram(
+  $: EngineInterface,
+  platform: Platform,
+  voice: SystemVoice,
+  text: string,
+  run: Run,
+): Promise<'spoke' | 'missing' | 'failed'> {
+  let pid: string | undefined
+  const kill = () => {
+    if (pid !== undefined) void $.process.run(stopCommand(platform, pid, false)).catch(() => undefined)
+    if (voice.cancel !== undefined) void $.process.run(voice.cancel).catch(() => undefined)
+  }
+  run.stop = () => {
+    run.isStopped = true
+    kill()
+  }
+  try {
+    const child = $.process.spawn({
+      argv: voice.argv,
+      ...(voice.textVia === 'env' ? { env: { [TEXT_VAR]: text } } : { input: text }),
+    })
+    let pending = ''
+    for await (const { stream, text: piece } of child) {
+      if (stream !== 'stdout' || pid !== undefined) continue
+      pending += piece
+      const first = /^pid (\d+)\r?\n/.exec(pending)
+      if (first !== null) {
+        pid = first[1]
+        if (run.isStopped) kill()
+      }
+    }
+    const ended = await child.result
+    if (run.isStopped || ended.code === 0) return 'spoke'
+    return ended.code === NOT_FOUND ? 'missing' : 'failed'
+  } catch {
+    return run.isStopped ? 'spoke' : 'missing'
   }
 }
 
@@ -700,8 +867,21 @@ let isSettingUp = false
 /** Whether this session has said once that `/speak setup` gives the natural voice. */
 let hasHintedSetup = false
 
+/** The first Python 3 that runs, as an argument list, or undefined. */
+async function findSetupPython($: EngineInterface, platform: Platform): Promise<string[] | undefined> {
+  for (const python of setupPythons(platform)) {
+    try {
+      const ran = await $.process.run([...python, '-c', 'import sys; print(sys.version_info[0])'])
+      if (ran.exitCode === 0 && ran.stdout.trim() === '3') return python
+    } catch {
+      // not installed: try the next
+    }
+  }
+  return undefined
+}
+
 /**
- * `/speak setup`: runs the mod's own tts\setup_voice.ps1, which installs the
+ * `/speak setup`: runs the mod's own tts/setup_voice.py, which installs the
  * Kokoro voice, in the background. Its `step` lines go to the status line, and
  * a toast says how it ended.
  */
@@ -710,12 +890,19 @@ async function startSetup($: EngineInterface): Promise<string> {
   if ((await findKokoro($)) !== undefined) return 'The natural voice is already installed.'
   const root = (await $.process.hookEnv()).CLAUDE_PLUGIN_ROOT
   if (!root) return 'Could not find the mod’s folder, so the voice setup cannot run.'
+  const platform = await platformOf($)
+  const home = (await homesHere($, platform))[0]
+  if (home === undefined) return 'Could not find a folder to install the voice in (no home folder is set).'
+  const python = await findSetupPython($, platform)
+  if (python === undefined) {
+    return 'Python 3 was not found. Install Python 3.12 from https://www.python.org/downloads/ and run /speak setup again.'
+  }
   isSettingUp = true
   void (async () => {
     let failed: string | undefined
     try {
       const child = $.process.spawn({
-        argv: ['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', `${root}\\tts\\setup_voice.ps1`],
+        argv: [...python, '-I', joinPath(platform, root, 'tts', 'setup_voice.py'), '--install-dir', home],
       })
       let pending = ''
       for await (const { stream, text } of child) {
@@ -745,12 +932,29 @@ async function startSetup($: EngineInterface): Promise<string> {
   return 'Setting up the natural voice: a Python environment and a 340 MB voice model. It takes a few minutes; the status line shows each step.'
 }
 
-/** How to start a reading where the session is drawn: the right-click row is the desktop app's alone. */
+/**
+ * How to start a reading where the session is drawn: the right-click row is
+ * the desktop app's alone, and a surface may report no selection at all.
+ */
 async function howToRead($: EngineInterface, isFullscreen: boolean): Promise<string> {
   const surfaces = await $.session.surfaces()
-  if (surfaces.includes('desktop')) return 'Select text in a reply, then right-click → 🔊 Read aloud (or type /speak).'
+  const last = 'Or type /speak last to hear Claude’s latest reply.'
+  if (surfaces.includes('desktop')) return `Select text in a reply, then right-click → 🔊 Read aloud (or type /speak). ${last}`
   const how = 'Select text in a reply with the mouse, then type /speak.'
-  return surfaces.includes('terminal') && !isFullscreen ? `${how} (The terminal reports a selection only in its fullscreen layout.)` : how
+  if (surfaces.includes('terminal') && !isFullscreen) {
+    return `${how} (The terminal reports a selection only in its fullscreen layout.) ${last}`
+  }
+  return `${how} ${last}`
+}
+
+/** The newest reply block drawn, which /speak last reads; an older row redrawn does not count. */
+let lastReply: { rowId: string; text: string } | undefined
+const seenReplies = new Set<string>()
+
+function rememberReply(rowId: string, text: string): void {
+  if (lastReply?.rowId !== rowId && seenReplies.has(rowId)) return
+  seenReplies.add(rowId)
+  lastReply = { rowId, text }
 }
 
 export const register: Register = on => {
@@ -758,9 +962,9 @@ export const register: Register = on => {
     await $.command.register({
       name: 'speak',
       description:
-        'Read aloud: /speak reads your selected text, /speak stop stops, /speak voice picks the voice, ' +
-        '/speak mark how the word is marked, /speak setup installs the natural voice',
-      argumentHint: '[stop | setup | voice <name> | mark orange|color|code|bold]',
+        'Read aloud: /speak reads your selected text, /speak last the latest reply, /speak stop stops, ' +
+        '/speak voice picks the voice, /speak mark how the word is marked, /speak setup installs the natural voice',
+      argumentHint: '[last | stop | setup | voice <name> | mark orange|color|code|bold]',
     })
     // The "Speak reply" pane of earlier versions: close it if it is still open.
     void $.ui.close({ id: OLD_PANE }).catch(() => undefined)
@@ -799,6 +1003,7 @@ export const register: Register = on => {
   // command's output and the person's own messages. Only the drawing changes;
   // the stored messages stay as they were.
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    if (e.props.isSummary !== true) rememberReply(e.requestId, e.props.text)
     const d = await decide($, e.requestId, e.props.text, true, e.props.isSummary === true)
     if (d.kind === 'pass') return next(e)
     if (d.kind === 'rewrite') return next({ ...e, props: { ...e.props, text: d.text } })
@@ -833,7 +1038,7 @@ export const register: Register = on => {
     const stop = <Button key="stop" plain label="■" onPress={() => stopSpeaking($)} />
 
     if (view.voice === 'windows' || view.current < 0) {
-      const note = view.voice === 'windows' ? 'Reading with the Windows voice (no word tracking)…' : 'Starting the voice…'
+      const note = view.voice === 'windows' ? 'Reading with the system voice (no word tracking)…' : 'Starting the voice…'
       return (
         <Box flexDirection="row" gap={1}>
           {stop}
@@ -902,6 +1107,10 @@ export const register: Register = on => {
       return { text: `Voice set to ${wanted}.` }
     }
     if (arg === 'setup') return { text: await startSetup($) }
+    if (arg === 'last') {
+      if (lastReply === undefined) return { text: 'There is no reply to read yet.' }
+      return { text: await speakSelection($, lastReply.text, lastReply.rowId, 'the latest reply') }
+    }
     if (arg === '') {
       const selected = await $.ui.selection()
       if (selected !== undefined && selected.text.trim() !== '') {
@@ -910,7 +1119,7 @@ export const register: Register = on => {
       return { text: `Nothing selected. ${await howToRead($, e.presentation?.isFullscreen === true)}` }
     }
     return {
-      text: `Unknown option "${e.args.trim()}". Use /speak, /speak stop, /speak setup, /speak voice <name> or /speak mark orange|color|code|bold.`,
+      text: `Unknown option "${e.args.trim()}". Use /speak, /speak last, /speak stop, /speak setup, /speak voice <name> or /speak mark orange|color|code|bold.`,
     }
   })
 }

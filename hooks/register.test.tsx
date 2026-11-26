@@ -72,6 +72,7 @@ test('a selected table is explained by a fast model, the text around it read as 
   const spawned: string[] = []
   const asked: { model: string; prompt: string }[] = []
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
@@ -140,6 +141,7 @@ const PLANS_COPIED = 'Here are the two plans.\nPlan\tPrice\tSpeed\nBasic\t5\tslo
  */
 function planReading(on: On, style: string | undefined, done: { wait: Promise<void> }): void {
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', (_, e) => ({ value: e.key === 'markStyle' ? style : undefined }))
@@ -241,6 +243,7 @@ test('the row shows the spoken word, a third of the way in, within the width', (
 test('right-click Read aloud speaks the selection with Kokoro, in the chosen voice', async ($, on) => {
   const spawned: { argv: readonly string[]; input?: string }[] = []
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', (_, e) => ({ value: !e.path.includes('Packages') }))
   on('store.get', () => ({ value: 'bm_george' }))
@@ -274,6 +277,7 @@ test('the spoken word is marked in the reply row itself, and only there', async 
   const done = gate()
   const reply = 'Intro.\n\nOnly **this** part is read aloud.'
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', (_, e) => ({ value: e.key === 'markStyle' ? 'code' : undefined }))
@@ -322,6 +326,7 @@ test('orange (the default): the block with the word is drawn with it bold in Cla
   const done = gate()
   const reply = 'Intro paragraph stays markdown.\n\nOnly **this** part is read aloud.\n\nLast paragraph too.'
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
@@ -363,6 +368,7 @@ test('a heading and a list being read are spaced and indented as the app lays th
   const done = gate()
   const reply = 'Intro paragraph stays markdown.\n\n### Steps to take\n\n- first step here\n- second step\n  - inner step\n\nLast paragraph too.'
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
@@ -409,6 +415,7 @@ test('a second reading after /speak mark bold still marks (the reported sequence
   const gates = [gate(), gate()]
   let runs = 0
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', (_, e) => ({ value: e.key === 'markStyle' ? style : undefined }))
@@ -462,6 +469,7 @@ test('a second reading after /speak mark bold still marks (the reported sequence
 /** Stand-ins for a Kokoro reading that has spoken `words` and waits at `done`. */
 function kokoroSpeaking(on: On, words: number[], done: { wait: Promise<void> }, style?: string) {
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', (_, e) => ({ value: e.key === 'markStyle' ? style : undefined }))
@@ -532,6 +540,7 @@ test('a command output row and the person’s own message are marked too', { tim
   const done2 = gate()
   let runs = 0
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
@@ -589,6 +598,7 @@ test('a command output row and the person’s own message are marked too', { tim
 test('the band above the prompt lights the word being spoken, then goes away', async ($, on) => {
   const done = gate()
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
@@ -624,6 +634,7 @@ test('/speak stop ends the Kokoro process at once', async ($, on) => {
   const killed: (readonly string[])[] = []
   const exited = gate()
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
@@ -649,10 +660,11 @@ test('/speak stop ends the Kokoro process at once', async ($, on) => {
   expect(killed).toEqual([['taskkill', '/F', '/T', '/PID', '4242']])
 })
 
-test('when Kokoro fails, the Windows voice reads it and a toast says why', async ($, on) => {
+test('when Kokoro fails, the system voice reads it and a toast says why', async ($, on) => {
   const spoken: string[] = []
   const toasts: string[] = []
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
@@ -675,7 +687,7 @@ test('when Kokoro fails, the Windows voice reads it and a toast says why', async
   await ui.unmount()
 
   expect(spoken).toEqual(['Fallback words.'])
-  expect(toasts).toEqual(['Kokoro voice failed (RuntimeError: no audio device); using the Windows voice.'])
+  expect(toasts).toEqual(['Kokoro voice failed (RuntimeError: no audio device); using the system voice.'])
 })
 
 test('/speak voice lists, sets and refuses voices; other options are refused', async ($, on) => {
@@ -695,7 +707,7 @@ test('/speak voice lists, sets and refuses voices; other options are refused', a
   expect(bad.text).toBe('"robot" is not one of the voices. Type /speak voice to list them.')
   const old = await $.command.run(speak('3'))
   expect(old.text).toBe(
-    'Unknown option "3". Use /speak, /speak stop, /speak setup, /speak voice <name> or /speak mark orange|color|code|bold.',
+    'Unknown option "3". Use /speak, /speak last, /speak stop, /speak setup, /speak voice <name> or /speak mark orange|color|code|bold.',
   )
 })
 
@@ -704,8 +716,12 @@ test('/speak setup runs the setup script, shows its steps, and says when the voi
   const statuses: (string | undefined)[] = []
   const toasts: string[] = []
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: false })) // no voice installed yet
+  on('process.run', (_, e) =>
+    e.argv[0] === 'py' ? { value: { ...RAN.value, stdout: '3\r\n' } } : { value: { ...RAN.value, exitCode: 9009 } },
+  )
   on('process.spawn', async function* (_, e): Spawned {
     argv.push(e.argv)
     yield { stream: 'stdout', text: 'step 1/4 Finding Python\r\nstep 2/4 Creating' }
@@ -726,7 +742,7 @@ test('/speak setup runs the setup script, shows its steps, and says when the voi
   expect(started.text).toMatch(/^Setting up the natural voice/)
   await settle(() => toasts.length > 0)
   expect(argv).toEqual([
-    ['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\mod\\tts\\setup_voice.ps1'],
+    ['py', '-3', '-I', 'C:\\mod\\tts\\setup_voice.py', '--install-dir', 'C:\\L\\paragraph-speaker'],
   ])
   expect(statuses).toEqual(['🔊 Voice setup 1/4 Finding Python…', '🔊 Voice setup 2/4 Creating the Python environment…', undefined])
   expect(toasts).toEqual(['The natural voice is ready. Select text and read it aloud.'])
@@ -736,8 +752,10 @@ test('/speak setup says why it failed, and does nothing when the voice is there'
   const toasts: string[] = []
   let isInstalled = false
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: isInstalled }))
+  on('process.run', () => ({ value: { ...RAN.value, stdout: '3\n' } }))
   on('process.spawn', async function* (): Spawned {
     yield { stream: 'stdout', text: 'step 1/4 Finding Python\nerror Python 3.10 to 3.13 was not found.\n' }
     return { value: { code: 1, signal: null } }
@@ -760,18 +778,19 @@ test('with nothing selected, /speak says how to select where the session is draw
   on('ui.selection', () => ({ value: undefined }))
   on('session.surfaces', () => ({ value: surfaces }))
   expect((await $.command.run(speak(''))).text).toBe(
-    'Nothing selected. Select text in a reply, then right-click → 🔊 Read aloud (or type /speak).',
+    'Nothing selected. Select text in a reply, then right-click → 🔊 Read aloud (or type /speak). Or type /speak last to hear Claude’s latest reply.',
   )
   surfaces = ['terminal']
   expect((await $.command.run(speak(''))).text).toBe(
-    'Nothing selected. Select text in a reply with the mouse, then type /speak. (The terminal reports a selection only in its fullscreen layout.)',
+    'Nothing selected. Select text in a reply with the mouse, then type /speak. (The terminal reports a selection only in its fullscreen layout.) Or type /speak last to hear Claude’s latest reply.',
   )
 })
 
-test('without the natural voice, the Windows voice reads and a toast offers /speak setup once', async ($, on) => {
+test('without the natural voice, the system voice reads and a toast offers /speak setup once', async ($, on) => {
   const spoken: string[] = []
   const toasts: string[] = []
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: false }))
   on('store.get', () => ({ value: undefined }))
@@ -794,7 +813,7 @@ test('without the natural voice, the Windows voice reads and a toast offers /spe
   await again.unmount()
 
   expect(spoken).toEqual(['First words.', 'Second words.'])
-  expect(toasts).toEqual(['Reading with the Windows voice. For the natural voice, with each word marked, type /speak setup.'])
+  expect(toasts).toEqual(['Reading with the system voice. For the natural voice, with each word marked, type /speak setup.'])
 })
 
 test('in the terminal, /speak reads the selection and marks it in a table, heading and list', { timeoutMs: 30_000 }, async ($, on) => {
