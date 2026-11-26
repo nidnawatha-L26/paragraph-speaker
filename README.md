@@ -24,8 +24,9 @@ Answer `y` to add the marketplace, then choose the **user** scope so the mod is 
 /speak setup
 ```
 
-This takes a few minutes, and the status line shows each step. It:
+It takes about 1 minute plus the time to download about 380 MB, so usually 2 to 6 minutes. The status line shows each step. It:
 
+- checks the disk has **1 GB free** first, and stops with a message if not: the voice uses about **500 MB**, and the rest keeps your disk from running full,
 - finds Python 3.10 to 3.13 on your computer (3.12 recommended, from [python.org](https://www.python.org/downloads/)),
 - creates a separate Python environment in the folder below, so nothing is added to your system Python,
 - installs [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) 0.6.1 there,
@@ -37,7 +38,7 @@ This takes a few minutes, and the status line shows each step. It:
 | macOS | `~/Library/Application Support/paragraph-speaker` |
 | Linux | `$XDG_DATA_HOME/paragraph-speaker`, or `~/.local/share/paragraph-speaker` |
 
-You can also run the same script by hand from the mod's folder: `python3 -I tts/setup_voice.py` (on Windows `py -3 -I tts\setup_voice.py`). It uses only Python's standard library.
+If the setup fails, it deletes what it made, so nothing is left taking up space. You can also run the same script by hand from the mod's folder: `python3 -I tts/setup_voice.py` (on Windows `py -3 -I tts\setup_voice.py`). It uses only Python's standard library.
 
 Until the voice is installed, the mod reads with the system's own voice, which works but cannot mark each word.
 
@@ -68,6 +69,10 @@ The text you listen to reaches the voice through standard input or an environmen
 | `/speak mark orange` | How the spoken word is marked: `orange` (default), `color`, `code` or `bold` |
 | `/speak setup` | Installs the natural voice |
 
+## Speed and memory
+
+The first reading in a session takes a few seconds while the voice loads. The voice then stays loaded, so later readings start in about a second, and it starts with the first few words instead of waiting for the whole first sentence. While loaded it uses about **600 MB of memory**, and it closes by itself after **10 minutes** without a reading. If it cannot be loaded, each reading starts the voice on its own, as before.
+
 ## Where it works
 
 - **Windows, macOS and Linux.** The mod asks Claude Code which system it runs on, and picks the install folder, the sound player, the way to stop and the fallback voice for it. Under WSL it acts as on Linux.
@@ -77,15 +82,15 @@ The text you listen to reaches the voice through standard input or an environmen
 - **Status line and toasts**: the setup's steps show in the status line and how it ended in a toast. Where a surface draws neither, the command's own reply still says what happens.
 - There is no speaker button in a reply's copy and bookmark row: Claude Code does not let a mod add to that row.
 
-Tested with Claude Code 2.1.331: the scripts on Windows 10, macOS 26 and Ubuntu (Linux).
+Tested with Claude Code 2.1.331: the scripts on Windows 10, macOS 26 and Ubuntu (Linux). The voice that stays loaded (1.2.0) is tested with real speech on Windows 11; on macOS and Linux its tests stand in for the system.
 
 ## Privacy
 
-Speech is made on your computer, and the text you listen to is not sent anywhere to be spoken. When your selection holds a table, the table is sent to Claude Haiku through your own Claude Code session to explain it, as any prompt is.
+Speech is made on your computer, and the text you listen to is not sent anywhere to be spoken. The loaded voice listens only on your computer: a private named pipe on Windows, and a socket in a folder only you can open on macOS and Linux, protected by a random key made each time it starts. Nothing is opened to the network. When your selection holds a table, the table is sent to Claude Haiku through your own Claude Code session to explain it, as any prompt is.
 
 ## Remove
 
-Uninstall it from `/plugin`. To remove the voice too, delete its folder (see the table under Install). On Windows, if the setup ran from the desktop app, it may be under `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\paragraph-speaker` instead.
+Uninstall it from `/plugin`. To remove the voice too, close Claude Code (so the loaded voice is not running), then delete its folder (see the table under Install). On Windows, if the setup ran from the desktop app, it may be under `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\paragraph-speaker` instead.
 
 ## Development
 

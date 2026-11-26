@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
-import type { CommandRunInput, On, ProcessSpawnChunk } from 'claude-code'
+import type { CommandRunInput, On, ProcessSpawnChunk, ProcessSpawnRequest } from 'claude-code'
 
 import { toSpeech, windowAround } from './register'
 
@@ -32,6 +32,26 @@ const speak = (args: string) =>
 const RAN = { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
 
 type Spawned = AsyncGenerator<ProcessSpawnChunk, { value: { code: number; signal: null } }>
+type SpawnHook = ($: unknown, e: ProcessSpawnRequest) => Spawned
+
+/** Where the stand-in for the loaded voice says it listens, and the key it asks for. */
+const PIPE = '\\\\.\\pipe\\paragraph-speaker-test'
+const KEY = 'k3y'
+
+/**
+ * The natural voice's processes, standing in: the voice kept loaded
+ * (`--serve`) says it is ready and stays; each reading's own process (the
+ * client of that voice, or the one-shot script) is `reading`.
+ */
+function voice(reading: SpawnHook): SpawnHook {
+  return async function* ($, e) {
+    if (e.argv.includes('--serve')) {
+      yield { stream: 'stdout', text: `ready ${PIPE} ${KEY}\n` }
+      await new Promise<void>(() => {})
+    }
+    return yield* reading($, e)
+  }
+}
 
 /** Lets the reading started in the background get as far as it can. */
 async function settle(isDone: () => boolean = () => false): Promise<void> {
@@ -82,12 +102,13 @@ test('a selected table is explained by a fast model, the text around it read as 
     const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
     return { value: { isAnswered: true as const, text: 'The table compares **two** plans: Pro costs more but is fast.', usage } }
   })
-  on('process.spawn', async function* (_, e): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (_, e): Spawned {
     spawned.push(e.input ?? '')
     yield { stream: 'stdout', text: 'pid 42\n' }
     await done.wait
     return { value: { code: 0, signal: null } }
-  })
+  }))
   on('ui.render', { component: 'AssistantMessage' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
     return <Text>{e.props.text}</Text>
@@ -156,11 +177,12 @@ function planReading(on: On, style: string | undefined, done: { wait: Promise<vo
     })
     return { value: { isAnswered: true as const, text, usage } }
   })
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     yield { stream: 'stdout', text: 'pid 42\nword 10\n' }
     await done.wait
     return { value: { code: 0, signal: null } }
-  })
+  }))
   on('ui.render', { component: 'AssistantMessage' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
     return <Text>{e.props.text}</Text>
@@ -241,36 +263,100 @@ test('the row shows the spoken word, a third of the way in, within the width', (
 })
 
 test('right-click Read aloud speaks the selection with Kokoro, in the chosen voice', async ($, on) => {
-  const spawned: { argv: readonly string[]; input?: string }[] = []
+  const spawned: { argv: readonly string[]; input?: string; env?: Record<string, string> }[] = []
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
   on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', (_, e) => ({ value: !e.path.includes('Packages') }))
   on('store.get', () => ({ value: 'bm_george' }))
-  on('process.spawn', async function* (_, e): Spawned {
-    spawned.push({ argv: e.argv, input: e.input })
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (_, e): Spawned {
+    spawned.push({ argv: e.argv, input: e.input, env: e.env })
     yield { stream: 'stdout', text: 'pid 42\n' }
     return { value: { code: 0, signal: null } }
-  })
+  }))
 
   const ui = await $.ui.mount({ ...MENU, props: { selection: { text: 'Only **this** part.' } } })
   await ui.press({ key: 'read-selection' })
   await settle(() => spawned.length > 0)
   await ui.unmount()
 
+  // This reading's own small client of the voice that stays loaded, with the voice's key.
+  const python = 'C:\\L\\paragraph-speaker\\venv\\Scripts\\python.exe'
   expect(spawned.length).toBe(1)
   expect(spawned[0]!.input).toBe('Only this part.')
-  expect(spawned[0]!.argv).toEqual([
-    'C:\\L\\paragraph-speaker\\venv\\Scripts\\python.exe',
-    '-I',
-    'C:\\mod\\tts\\kokoro_speak.py',
-    '--model',
-    'C:\\L\\paragraph-speaker\\models\\kokoro-v1.0.onnx',
-    '--voices',
-    'C:\\L\\paragraph-speaker\\models\\voices-v1.0.bin',
-    '--voice',
-    'bm_george',
-  ])
+  expect(spawned[0]!.argv).toEqual([python, '-I', 'C:\\mod\\tts\\voice_client.py', '--address', PIPE, '--voice', 'bm_george'])
+  expect(spawned[0]!.env).toEqual({ PARAGRAPH_SPEAKER_KEY: KEY })
+})
+
+/** Stand-ins for a reading in the Kokoro voice, every process it starts kept in `spawned`. */
+function kokoroReading(on: On, spawned: (readonly string[])[], reading: SpawnHook): void {
+  on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: 'C:\\mod' } }))
+  on('session.info', () => ({ value: { transcriptPath: 'session.jsonl', platform: 'windows' } }))
+  on('env.get', () => ({ value: 'C:\\L' }))
+  on('fs.exists', () => ({ value: true }))
+  on('store.get', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  // The give-up timer for a voice that never says it is ready: its time never comes here.
+  on('clock.after', () => new Promise(() => {}))
+  on('process.spawn', async function* ($, e): Spawned {
+    spawned.push(e.argv)
+    return yield* reading($, e)
+  })
+}
+
+const kindOf = (argv: readonly string[]) =>
+  argv.includes('--serve') ? 'serve' : argv.includes('C:\\mod\\tts\\voice_client.py') ? 'client' : 'one-shot'
+
+async function readSelection($: Engine, text: string, isDone: () => boolean): Promise<void> {
+  const ui = await $.ui.mount({ ...MENU, props: { selection: { text } } })
+  await ui.press({ key: 'read-selection' })
+  await settle(isDone)
+  await settle()
+  await ui.unmount()
+}
+
+test('the voice stays loaded: a second reading does not load it again', { timeoutMs: 30_000 }, async ($, on) => {
+  const spawned: (readonly string[])[] = []
+  kokoroReading(on, spawned, voice(async function* (): Spawned {
+    yield { stream: 'stdout', text: 'pid 42\nword 0\n' }
+    return { value: { code: 0, signal: null } }
+  }))
+  await readSelection($, 'First reading.', () => spawned.length >= 2)
+  await readSelection($, 'Second reading.', () => spawned.length >= 3)
+  expect(spawned.map(kindOf)).toEqual(['serve', 'client', 'client'])
+})
+
+test('when the loaded voice is gone, the reading goes on with a voice of its own, and the next one loads it again', { timeoutMs: 30_000 }, async ($, on) => {
+  const spawned: (readonly string[])[] = []
+  let clients = 0
+  kokoroReading(on, spawned, voice(async function* (_, e): Spawned {
+    if (kindOf(e.argv) === 'client' && ++clients === 1) {
+      // The first client finds no voice at the address: it exited unseen.
+      yield { stream: 'stdout', text: 'pid 41\n' }
+      yield { stream: 'stderr', text: 'the voice is not running: [WinError 2]\n' }
+      return { value: { code: 3, signal: null } }
+    }
+    yield { stream: 'stdout', text: 'pid 42\nword 0\n' }
+    return { value: { code: 0, signal: null } }
+  }))
+  await readSelection($, 'First reading.', () => spawned.length >= 3)
+  await readSelection($, 'Second reading.', () => spawned.length >= 5)
+  expect(spawned.map(kindOf)).toEqual(['serve', 'client', 'one-shot', 'serve', 'client'])
+})
+
+test('when the voice cannot be loaded, the reading uses a voice of its own', { timeoutMs: 30_000 }, async ($, on) => {
+  const spawned: (readonly string[])[] = []
+  kokoroReading(on, spawned, async function* (_, e): Spawned {
+    if (kindOf(e.argv) === 'serve') {
+      yield { stream: 'stderr', text: 'ModuleNotFoundError: No module named kokoro_onnx\n' }
+      return { value: { code: 1, signal: null } }
+    }
+    yield { stream: 'stdout', text: 'pid 42\nword 0\n' }
+    return { value: { code: 0, signal: null } }
+  })
+  await readSelection($, 'Read me.', () => spawned.length >= 2)
+  expect(spawned.map(kindOf)).toEqual(['serve', 'one-shot'])
 })
 
 test('the spoken word is marked in the reply row itself, and only there', async ($, on) => {
@@ -281,11 +367,12 @@ test('the spoken word is marked in the reply row itself, and only there', async 
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', (_, e) => ({ value: e.key === 'markStyle' ? 'code' : undefined }))
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     yield { stream: 'stdout', text: 'pid 42\nsentence 0 2\nword 0\nword 1\n' }
     await done.wait
     return { value: { code: 0, signal: null } }
-  })
+  }))
   // The engine's own drawing of a reply row, standing in: it draws the text it is handed.
   on('ui.render', { component: 'AssistantMessage' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
@@ -330,11 +417,12 @@ test('orange (the default): the block with the word is drawn with it bold in Cla
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     yield { stream: 'stdout', text: 'pid 42\nword 0\nword 1\nword 2\n' }
     await done.wait
     return { value: { code: 0, signal: null } }
-  })
+  }))
 
   const menu = await $.ui.mount({
     ...MENU,
@@ -372,11 +460,12 @@ test('a heading and a list being read are spaced and indented as the app lays th
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     yield { stream: 'stdout', text: 'pid 42\nword 4\n' }
     await done.wait
     return { value: { code: 0, signal: null } }
-  })
+  }))
   const menu = await $.ui.mount({
     ...MENU,
     props: { selection: { text: 'Steps to take\nfirst step here\nsecond step\ninner step', requestId: 'row-1' } },
@@ -423,12 +512,13 @@ test('a second reading after /speak mark bold still marks (the reported sequence
     style = e.value
     return { value: undefined }
   })
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     const mine = gates[runs++]!
     yield { stream: 'stdout', text: 'pid 42\nword 0\nword 1\n' }
     await mine.wait
     return { value: { code: 0, signal: null } }
-  })
+  }))
   on('ui.render', { component: 'AssistantMessage' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
     return <Text>{e.props.text}</Text>
@@ -473,11 +563,12 @@ function kokoroSpeaking(on: On, words: number[], done: { wait: Promise<void> }, 
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', (_, e) => ({ value: e.key === 'markStyle' ? style : undefined }))
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     yield { stream: 'stdout', text: `pid 42\n${words.map(w => `word ${w}\n`).join('')}` }
     await done.wait
     return { value: { code: 0, signal: null } }
-  })
+  }))
 }
 
 test('the blocks being read are drawn by the mod from the start, so they do not jump as the voice moves', { timeoutMs: 30_000 }, async ($, on) => {
@@ -545,12 +636,13 @@ test('a command output row and the person’s own message are marked too', { tim
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
   // One stand-in for both readings: hooks beneath the plugin are all set before the first call.
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     const isFirst = runs++ === 0
     yield { stream: 'stdout', text: isFirst ? 'pid 42\nword 0\nword 1\nword 2\n' : 'pid 43\nword 0\nword 1\n' }
     await (isFirst ? done : done2).wait
     return { value: { code: 0, signal: null } }
-  })
+  }))
   const output = 'paragraph-speaker: Spoken words will be marked as bold from the next reading.'
   const menu = await $.ui.mount({
     ...MENU,
@@ -602,13 +694,14 @@ test('the band above the prompt lights the word being spoken, then goes away', a
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     // Pieces arrive as the pipe gives them: a line may be split across two.
     yield { stream: 'stdout', text: 'pid 42\nsentence 0 2\nwo' }
     yield { stream: 'stdout', text: 'rd 0\nword 1\n' }
     await done.wait
     return { value: { code: 0, signal: null } }
-  })
+  }))
 
   const menu = await $.ui.mount({ ...MENU, props: { selection: { text: 'Only **this** part.' } } })
   await menu.press({ key: 'read-selection' })
@@ -638,11 +731,12 @@ test('/speak stop ends the Kokoro process at once', async ($, on) => {
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     yield { stream: 'stdout', text: 'pid 4242\n' }
     await exited.wait // speaking, until it is killed
     return { value: { code: 1, signal: null } }
-  })
+  }))
   on('process.run', (_, e) => {
     killed.push(e.argv)
     exited.open()
@@ -668,10 +762,11 @@ test('when Kokoro fails, the system voice reads it and a toast says why', async 
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: true }))
   on('store.get', () => ({ value: undefined }))
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     yield { stream: 'stderr', text: 'Traceback...\nRuntimeError: no audio device\n' }
     return { value: { code: 1, signal: null } }
-  })
+  }))
   on('ui.toast', (_, e) => {
     toasts.push(String(e.text))
     return { value: undefined }
@@ -722,13 +817,14 @@ test('/speak setup runs the setup script, shows its steps, and says when the voi
   on('process.run', (_, e) =>
     e.argv[0] === 'py' ? { value: { ...RAN.value, stdout: '3\r\n' } } : { value: { ...RAN.value, exitCode: 9009 } },
   )
-  on('process.spawn', async function* (_, e): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (_, e): Spawned {
     argv.push(e.argv)
     yield { stream: 'stdout', text: 'step 1/4 Finding Python\r\nstep 2/4 Creating' }
     yield { stream: 'stdout', text: ' the Python environment\r\n' }
     yield { stream: 'stdout', text: 'done C:\\L\\paragraph-speaker\r\n' }
     return { value: { code: 0, signal: null } }
-  })
+  }))
   on('ui.status', (_, e) => {
     statuses.push(e.text)
     return { value: undefined }
@@ -740,6 +836,7 @@ test('/speak setup runs the setup script, shows its steps, and says when the voi
 
   const started = await $.command.run(speak('setup'))
   expect(started.text).toMatch(/^Setting up the natural voice/)
+  expect(started.text).toMatch(/about 500 MB.*1 GB free/)
   await settle(() => toasts.length > 0)
   expect(argv).toEqual([
     ['py', '-3', '-I', 'C:\\mod\\tts\\setup_voice.py', '--install-dir', 'C:\\L\\paragraph-speaker'],
@@ -756,10 +853,11 @@ test('/speak setup says why it failed, and does nothing when the voice is there'
   on('env.get', () => ({ value: 'C:\\L' }))
   on('fs.exists', () => ({ value: isInstalled }))
   on('process.run', () => ({ value: { ...RAN.value, stdout: '3\n' } }))
-  on('process.spawn', async function* (): Spawned {
+  on('clock.after', () => new Promise(() => {})) // the voice's give-up timer never fires here
+  on('process.spawn', voice(async function* (): Spawned {
     yield { stream: 'stdout', text: 'step 1/4 Finding Python\nerror Python 3.10 to 3.13 was not found.\n' }
     return { value: { code: 1, signal: null } }
-  })
+  }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(e.text)

@@ -610,6 +610,7 @@ type KokoroInstall = {
   model: string
   voices: string
   script: string
+  client: string
 }
 
 /** Finds the Kokoro install, or undefined: then a system voice speaks. */
@@ -633,8 +634,11 @@ async function lookForKokoro($: EngineInterface): Promise<KokoroInstall | undefi
       model: joinPath(platform, home, 'models', 'kokoro-v1.0.onnx'),
       voices: joinPath(platform, home, 'models', 'voices-v1.0.bin'),
       script: joinPath(platform, root, 'tts', 'kokoro_speak.py'),
+      client: joinPath(platform, root, 'tts', 'voice_client.py'),
     }
-    const found = await Promise.all([install.python, install.model, install.voices, install.script].map(p => $.fs.exists(p)))
+    const found = await Promise.all(
+      [install.python, install.model, install.voices, install.script, install.client].map(p => $.fs.exists(p)),
+    )
     if (found.every(Boolean)) return install
   }
   return undefined
@@ -731,6 +735,76 @@ async function speakText(
   })()
 }
 
+/**
+ * The voice kept loaded between readings (kokoro_speak.py --serve), so a reading
+ * skips the 2 seconds Python and the 310 MB model take to load: the address it
+ * listens on (a named pipe on Windows, a private socket elsewhere) and the key
+ * it asks for. It exits by itself after SERVER_IDLE_SECONDS without a reading,
+ * giving back its memory (about 600 MB).
+ */
+type VoiceServer = { address: string; key: string; stop: () => void }
+let voiceServer: Promise<VoiceServer | undefined> | undefined
+const SERVER_IDLE_SECONDS = 600
+const SERVER_READY_MS = 60_000
+/** voice_client.py's exit code when the loaded voice cannot be reached. */
+const UNREACHABLE = 3
+
+/** The loaded voice, started on first use; undefined when it cannot start. */
+function loadedVoice($: EngineInterface, kokoro: KokoroInstall): Promise<VoiceServer | undefined> {
+  voiceServer ??= startVoiceServer($, kokoro)
+  return voiceServer
+}
+
+function startVoiceServer($: EngineInterface, kokoro: KokoroInstall): Promise<VoiceServer | undefined> {
+  // `-I` keeps Python from loading anything from the current or script folder.
+  const child = $.process.spawn({
+    argv: [
+      kokoro.python, '-I', kokoro.script, '--serve',
+      '--model', kokoro.model, '--voices', kokoro.voices, '--idle', String(SERVER_IDLE_SECONDS),
+    ],
+    cwd: kokoro.home,
+  })
+  const stop = () => void child.return(undefined as never).catch(() => undefined)
+  let settle: (server: VoiceServer | undefined) => void = () => {}
+  const ready = new Promise<VoiceServer | undefined>(resolve => {
+    settle = resolve
+  })
+  // A voice that never says it is ready is given up on, and the reading goes on without it.
+  const timer = $.clock.after(SERVER_READY_MS, () => {
+    note('voice server: not ready in time')
+    settle(undefined)
+    stop()
+  })
+  void (async () => {
+    let pending = ''
+    try {
+      for await (const { stream, text } of child) {
+        if (stream !== 'stdout') continue
+        pending += text
+        const lines = pending.split(/\r?\n/)
+        pending = lines.pop() ?? ''
+        for (const line of lines) {
+          const [kind, address, key] = line.trim().split(' ')
+          if (kind === 'ready' && address && key) {
+            timer.cancel()
+            note(`voice server: ready at ${address}`)
+            settle({ address, key, stop })
+          }
+        }
+      }
+    } catch (error) {
+      note(`voice server: could not start: ${String(error)}`)
+    } finally {
+      timer.cancel()
+      settle(undefined)
+      note('voice server: ended')
+      // Ended (idle, failed or killed): the next reading starts a new one.
+      if (voiceServer === ready) voiceServer = undefined
+    }
+  })()
+  return ready
+}
+
 /** Speaks with Kokoro, following its word reports; undefined when done or stopped, else why it failed. */
 async function speakWithKokoro(
   $: EngineInterface,
@@ -739,18 +813,54 @@ async function speakWithKokoro(
   run: Run,
 ): Promise<string | undefined> {
   const voice = await chosenVoice($)
-  // `-I` keeps Python from loading anything from the current or script folder.
-  const child = $.process.spawn({
+  const loaded = voiceServer
+  const server = await loadedVoice($, kokoro)
+  if (run.isStopped) return undefined
+  if (server !== undefined) {
+    note(`kokoro: reading through the loaded voice${loaded === undefined ? ' (just started)' : ''}`)
+    // Stop ends the client alone: its connection closes, and the loaded voice goes quiet.
+    const ended = await runVoice($, kokoro.platform, run, text, {
+      argv: [kokoro.python, '-I', kokoro.client, '--address', server.address, '--voice', voice],
+      cwd: kokoro.home,
+      env: { PARAGRAPH_SPEAKER_KEY: server.key },
+      isGroup: false,
+    })
+    if (ended.code !== UNREACHABLE) return ended.failed
+    // Gone (or ended mid-reading): drop it, and read this one with a voice of its own.
+    note('kokoro: the loaded voice is gone; reading without it')
+    server.stop()
+    if (voiceServer !== undefined && (await voiceServer) === server) voiceServer = undefined
+    if (run.isStopped) return undefined
+  }
+  // The script leads its own process group on macOS and Linux: Stop ends it and its player.
+  const ended = await runVoice($, kokoro.platform, run, text, {
     argv: [kokoro.python, '-I', kokoro.script, '--model', kokoro.model, '--voices', kokoro.voices, '--voice', voice],
     cwd: kokoro.home,
-    input: text,
+    isGroup: true,
   })
+  return ended.failed
+}
+
+/**
+ * Runs one reading's process (the one-shot script, or the client of the loaded
+ * voice), which says its process id first and then each word as it is spoken.
+ * `failed`: undefined when done or stopped, else why; `code`: its exit code.
+ */
+async function runVoice(
+  $: EngineInterface,
+  platform: Platform,
+  run: Run,
+  text: string,
+  start: { argv: string[]; cwd: string; env?: Record<string, string>; isGroup: boolean },
+): Promise<{ failed: string | undefined; code: number | null }> {
+  const { isGroup, ...spawn } = start
+  const child = $.process.spawn({ ...spawn, input: text })
   let pid: string | undefined
   let pending = ''
   let stderr = ''
-  // The script names its process first; Stop ends that process (and its player), which ends the sound.
+  // The process names itself first; Stop ends that process, which ends the sound.
   const kill = () => {
-    if (pid !== undefined) void $.process.run(stopCommand(kokoro.platform, pid, true)).catch(() => undefined)
+    if (pid !== undefined) void $.process.run(stopCommand(platform, pid, isGroup)).catch(() => undefined)
   }
   run.stop = () => {
     run.isStopped = true
@@ -769,7 +879,7 @@ async function speakWithKokoro(
       const [kind, a] = line.trim().split(' ')
       if (kind === 'pid' && pid === undefined) {
         pid = a
-        note(`kokoro: process ${pid}, voice ${voice}`)
+        note(`kokoro: process ${pid}`)
         await flushNotes($)
         if (run.isStopped) kill()
       } else if (kind === 'word' && !run.isStopped) {
@@ -783,11 +893,11 @@ async function speakWithKokoro(
     }
   }
   note(`kokoro: ${heard} words spoken${run.isStopped ? ', stopped' : ''}`)
-  if (run.isStopped) return undefined
+  if (run.isStopped) return { failed: undefined, code: null }
   const ended = await child.result
   note(`kokoro: exit code ${ended.code}${stderr.trim() === '' ? '' : `, last error line ${peek(stderr.trim().split(/\r?\n/).at(-1) ?? '')}`}`)
-  if (ended.code === 0) return undefined
-  return stderr.trim().split(/\r?\n/).at(-1) || `exit code ${ended.code}`
+  if (ended.code === 0) return { failed: undefined, code: 0 }
+  return { failed: stderr.trim().split(/\r?\n/).at(-1) || `exit code ${ended.code}`, code: ended.code }
 }
 
 /**
@@ -929,7 +1039,10 @@ async function startSetup($: EngineInterface): Promise<string> {
     const said = failed === undefined ? 'The natural voice is ready. Select text and read it aloud.' : `Voice setup failed: ${failed}`
     await Promise.resolve($.ui.toast(said)).catch(() => undefined)
   })()
-  return 'Setting up the natural voice: a Python environment and a 340 MB voice model. It takes a few minutes; the status line shows each step.'
+  return (
+    'Setting up the natural voice: a Python environment and the voice model, about 500 MB on disk ' +
+    '(it starts only with 1 GB free). It takes a few minutes; the status line shows each step.'
+  )
 }
 
 /**
