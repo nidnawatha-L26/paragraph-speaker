@@ -1,7 +1,10 @@
 """Installs the natural voice (Kokoro) for the paragraph-speaker mod, once: a
 Python environment with kokoro-onnx, and the two voice model files, each one
 checked against its known SHA-256 before it is used. Everything goes into one
-folder (see install_dir); delete that folder to remove it.
+folder (see install_dir), about 500 MB; delete that folder to remove it.
+
+It starts only when the disk has --need-mb free (1 GB: what it uses, plus room
+so the disk is never left full), and a run that fails deletes what it made.
 
 Run it from Claude Code by typing   /speak setup
 or by hand, with any Python 3:      python3 -I setup_voice.py [--install-dir DIR]
@@ -14,6 +17,7 @@ Standard library only, so it runs before anything is installed.
 from __future__ import annotations
 
 import argparse
+import errno
 import glob
 import hashlib
 import os
@@ -26,10 +30,12 @@ from typing import Callable, Mapping, Optional
 PACKAGE = "kokoro-onnx==0.6.1"  # installs on Python 3.10 to 3.13
 WANTED = ("3.12", "3.13", "3.11", "3.10")
 RELEASE = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+# The small file first: a failed download then throws away as little as it can.
 MODELS = (
-    ("kokoro-v1.0.onnx", "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5"),
     ("voices-v1.0.bin", "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d"),
+    ("kokoro-v1.0.onnx", "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5"),
 )
+NEED_MB = 1024
 
 
 def step(n: int, what: str) -> None:
@@ -39,6 +45,46 @@ def step(n: int, what: str) -> None:
 def fail(why: str) -> int:
     print(f"error {why}", flush=True)
     return 1
+
+
+def free_mb(path: str) -> Optional[int]:
+    """Free space, in MB, on the disk `path` is or would be on; None when it cannot be measured."""
+    probe = os.path.abspath(path)
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    try:
+        return shutil.disk_usage(probe).free // (1024 * 1024)
+    except OSError:
+        return None
+
+
+class Made:
+    """What this run creates, deleted again if it fails, so a failed setup leaves nothing behind."""
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    def folder(self, path: str) -> None:
+        if not os.path.isdir(path):
+            os.makedirs(path)
+            self.paths.append(path)
+
+    def add(self, path: str) -> None:
+        """A path this run is about to create."""
+        self.paths.append(path)
+
+    def undo(self) -> None:
+        for path in reversed(self.paths):
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 
 def install_dir(platform: str, env: Mapping[str, str], home: str) -> str:
@@ -127,16 +173,40 @@ def last_line(text: str) -> str:
     return lines[-1] if lines else ""
 
 
-def main() -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--install-dir", default=install_dir(sys.platform, os.environ, os.path.expanduser("~")))
-    args = ap.parse_args()
+    ap.add_argument("--need-mb", type=int, default=NEED_MB, help="free space to start with, in MB")
+    args = ap.parse_args(argv)
     target = args.install_dir
 
+    # Room on the disk first: when the system disk runs full, the system and its apps start failing.
+    free = free_mb(target)
+    if free is not None and free < args.need_mb:
+        return fail(
+            f"Not enough free space: the disk for {target} has {free:,} MB free, and the setup needs "
+            f"{args.need_mb:,} MB (the voice uses about 500 MB; the rest keeps the disk from running full). "
+            "Free up space and run /speak setup again."
+        )
+
+    made = Made()
+    try:
+        why = install(target, made)
+    except Exception as error:  # anything unforeseen still cleans up after itself
+        why = f"The setup stopped: {error}"
+    if why is not None:
+        made.undo()
+        return fail(why)
+    print(f"done {target}", flush=True)
+    return 0
+
+
+def install(target: str, made: Made) -> Optional[str]:
+    """Runs the four steps; what went wrong, or None when the voice is installed."""
     step(1, "Finding Python")
     python = find_python(sys.platform, os.environ)
     if python is None:
-        return fail(
+        return (
             "Python 3.10 to 3.13 was not found. Install Python 3.12 from https://www.python.org/downloads/ "
             "and run /speak setup again."
         )
@@ -145,23 +215,28 @@ def main() -> int:
     step(2, "Creating the Python environment")
     venv = os.path.join(target, "venv")
     own = venv_python(sys.platform, venv)
+    made.folder(target)
     if not os.path.isfile(own):
-        os.makedirs(target, exist_ok=True)
+        if not os.path.exists(venv):
+            made.add(venv)
         ran = subprocess.run([*python, "-m", "venv", venv], capture_output=True, text=True)
         if ran.returncode != 0 or not os.path.isfile(own):
             hint = " (on Debian or Ubuntu, install python3-venv)" if sys.platform.startswith("linux") else ""
-            return fail(f"Could not create the Python environment{hint}: {last_line(ran.stderr + ran.stdout)}")
+            return f"Could not create the Python environment{hint}: {last_line(ran.stderr + ran.stdout)}"
 
     step(3, f"Installing the voice engine ({PACKAGE.split('==')[0]})")
+    # --no-cache-dir: no second copy of the downloads in pip's own cache folder.
     ran = subprocess.run(
-        [own, "-m", "pip", "install", "--disable-pip-version-check", "--quiet", PACKAGE], capture_output=True, text=True
+        [own, "-m", "pip", "install", "--disable-pip-version-check", "--quiet", "--no-cache-dir", PACKAGE],
+        capture_output=True,
+        text=True,
     )
     if ran.returncode != 0:
-        return fail(f"pip could not install {PACKAGE}: {last_line(ran.stderr + ran.stdout)}")
+        return f"pip could not install {PACKAGE}: {last_line(ran.stderr + ran.stdout)}"
 
     step(4, "Downloading the voice model (about 340 MB)")
     models = os.path.join(target, "models")
-    os.makedirs(models, exist_ok=True)
+    made.folder(models)
     for name, expected in MODELS:
         path = os.path.join(models, name)
         if is_model(path, expected):
@@ -170,21 +245,22 @@ def main() -> int:
         try:
             with urllib.request.urlopen(f"{RELEASE}/{name}", timeout=60) as response, open(part, "wb") as out:
                 shutil.copyfileobj(response, out, 1 << 20)
-        except OSError:
+        except OSError as error:
             if os.path.exists(part):
                 os.remove(part)
-            return fail(f"Could not download {name}. Check the internet connection and run /speak setup again.")
+            if error.errno == errno.ENOSPC:
+                return f"The disk ran full while downloading {name}. Free up space and run /speak setup again."
+            return f"Could not download {name}. Check the internet connection and run /speak setup again."
         if not is_model(part, expected):
             os.remove(part)
-            return fail(f"{name} did not match its known checksum, so it was deleted. Run /speak setup again.")
+            return f"{name} did not match its known checksum, so it was deleted. Run /speak setup again."
         os.replace(part, path)
+        made.add(path)
 
     ran = subprocess.run([own, "-I", "-c", "import kokoro_onnx"], capture_output=True, text=True)
     if ran.returncode != 0:
-        return fail(f"The voice engine did not load: {last_line(ran.stderr + ran.stdout)}")
-
-    print(f"done {target}", flush=True)
-    return 0
+        return f"The voice engine did not load: {last_line(ran.stderr + ran.stdout)}"
+    return None
 
 
 if __name__ == "__main__":

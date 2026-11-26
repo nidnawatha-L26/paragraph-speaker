@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import type { CommandRunInput, On, ProcessSpawnChunk } from 'claude-code'
+import type { CommandRunInput, On, ProcessSpawnChunk, ProcessSpawnRequest } from 'claude-code'
 
 // The same readings on each system, driven through the engine as a session does.
 
@@ -11,6 +11,25 @@ const speak = (args: string) =>
 const RAN = { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
 
 type Spawned = AsyncGenerator<ProcessSpawnChunk, { value: { code: number; signal: null } }>
+type SpawnHook = ($: unknown, e: ProcessSpawnRequest) => Spawned
+
+/** Where the stand-in for the loaded voice says it listens (a socket, off Windows), and its key. */
+const SOCKET = '/tmp/paragraph-speaker.voice-test/s'
+const KEY = 'k3y'
+
+/**
+ * The voice kept loaded (`--serve`), standing in: it says it is ready and
+ * stays. Each reading's own process is `reading`.
+ */
+function voice(reading: SpawnHook): SpawnHook {
+  return async function* ($, e) {
+    if (e.argv.includes('--serve')) {
+      yield { stream: 'stdout', text: `ready ${SOCKET} ${KEY}\n` }
+      await new Promise<void>(() => {})
+    }
+    return yield* reading($, e)
+  }
+}
 
 async function settle(isDone: () => boolean = () => false): Promise<void> {
   for (let i = 0; i < 1000 && !isDone(); i++) await Promise.resolve()
@@ -30,9 +49,53 @@ function machine(on: On, platform: 'windows' | 'macos' | 'linux', env: Record<st
   on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: root } }))
   on('env.get', (_, e) => ({ value: env[e.name] }))
   on('store.get', () => ({ value: undefined }))
+  // The loaded voice's give-up timer: its time never comes here.
+  on('clock.after', () => new Promise(() => {}))
 }
 
-test('macOS: Kokoro runs from Application Support, and stop ends its process group', async ($, on) => {
+test('macOS: Kokoro loads from Application Support, and stop ends the reading, not the loaded voice', async ($, on) => {
+  const spawned: { argv: readonly string[]; env?: Record<string, string> }[] = []
+  const killed: (readonly string[])[] = []
+  const exited = gate()
+  machine(on, 'macos', { HOME: '/Users/u' }, '/mod')
+  on('fs.exists', () => ({ value: true }))
+  on('process.spawn', async function* (_, e): Spawned {
+    spawned.push({ argv: e.argv, ...(e.env === undefined ? {} : { env: e.env }) })
+    return yield* voice(async function* (): Spawned {
+      yield { stream: 'stdout', text: 'pid 4242\n' }
+      await exited.wait
+      return { value: { code: 1, signal: null } }
+    })(_, e)
+  })
+  on('process.run', (_, e) => {
+    killed.push(e.argv)
+    exited.open()
+    return RAN
+  })
+
+  const ui = await $.ui.mount({ ...MENU, props: { selection: { text: 'Mac words.' } } })
+  await ui.press({ key: 'read-selection' })
+  await settle(() => spawned.length > 1)
+  await settle()
+  await $.command.run(speak('stop'))
+  await settle(() => killed.length > 0)
+  await ui.unmount()
+
+  const home = '/Users/u/Library/Application Support/paragraph-speaker'
+  const python = `${home}/venv/bin/python`
+  expect(spawned.map(s => s.argv)).toEqual([
+    [
+      python, '-I', '/mod/tts/kokoro_speak.py', '--serve',
+      '--model', `${home}/models/kokoro-v1.0.onnx`, '--voices', `${home}/models/voices-v1.0.bin`, '--idle', '600',
+    ],
+    [python, '-I', '/mod/tts/voice_client.py', '--address', SOCKET, '--voice', 'af_heart'],
+  ])
+  expect(spawned[1]?.env).toEqual({ PARAGRAPH_SPEAKER_KEY: KEY })
+  // The client alone: its connection closes and the loaded voice goes quiet, ready for the next reading.
+  expect(killed).toEqual([['kill', '-TERM', '4242']])
+})
+
+test('macOS: when the voice cannot be loaded, the script reads on its own, and stop ends its process group', async ($, on) => {
   const spawned: (readonly string[])[] = []
   const killed: (readonly string[])[] = []
   const exited = gate()
@@ -40,6 +103,10 @@ test('macOS: Kokoro runs from Application Support, and stop ends its process gro
   on('fs.exists', () => ({ value: true }))
   on('process.spawn', async function* (_, e): Spawned {
     spawned.push(e.argv)
+    if (e.argv.includes('--serve')) {
+      yield { stream: 'stderr', text: 'no audio player found\n' }
+      return { value: { code: 3, signal: null } }
+    }
     yield { stream: 'stdout', text: 'pid 4242\n' }
     await exited.wait
     return { value: { code: 1, signal: null } }
@@ -52,14 +119,14 @@ test('macOS: Kokoro runs from Application Support, and stop ends its process gro
 
   const ui = await $.ui.mount({ ...MENU, props: { selection: { text: 'Mac words.' } } })
   await ui.press({ key: 'read-selection' })
-  await settle(() => spawned.length > 0)
+  await settle(() => spawned.length > 1)
   await settle()
   await $.command.run(speak('stop'))
   await settle(() => killed.length > 0)
   await ui.unmount()
 
   const home = '/Users/u/Library/Application Support/paragraph-speaker'
-  expect(spawned[0]).toEqual([
+  expect(spawned[1]).toEqual([
     `${home}/venv/bin/python`,
     '-I',
     '/mod/tts/kokoro_speak.py',
@@ -79,8 +146,10 @@ test('Linux: Kokoro runs from XDG_DATA_HOME when it is set', async ($, on) => {
   on('fs.exists', () => ({ value: true }))
   on('process.spawn', async function* (_, e): Spawned {
     spawned.push(e.argv)
-    yield { stream: 'stdout', text: 'pid 7\n' }
-    return { value: { code: 0, signal: null } }
+    return yield* voice(async function* (): Spawned {
+      yield { stream: 'stdout', text: 'pid 7\n' }
+      return { value: { code: 0, signal: null } }
+    })(_, e)
   })
 
   const ui = await $.ui.mount({ ...MENU, props: { selection: { text: 'Linux words.' } } })
@@ -218,11 +287,11 @@ test('/speak last reads the newest reply, where no selection can be made', async
   const inputs: string[] = []
   machine(on, 'linux', { HOME: '/home/u' }, '/mod')
   on('fs.exists', () => ({ value: true }))
-  on('process.spawn', async function* (_, e): Spawned {
+  on('process.spawn', voice(async function* (_, e): Spawned {
     inputs.push(e.input ?? '')
     yield { stream: 'stdout', text: 'pid 3\n' }
     return { value: { code: 0, signal: null } }
-  })
+  }))
   const row = (requestId: string, text: string) =>
     $.ui.mount({
       plugin: 'paragraph-speaker',
